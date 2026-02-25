@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>Dithering</title>
+    </head>
+    <body>
+        <input type="file" id="fileInput" accept="image/*" />
+        <br /><br />
+
+        <label
+            >Algorithm:
+            <select id="algorithm">
+                <option value="floyd">Floyd-Steinberg</option>
+                <option value="bayer">Bayer 4x4</option>
+                <option value="random">Random</option>
+            </select>
+        </label>
+        <br /><br />
+
+        <label
+            >Pixel size:
+            <span id="pixelSizeVal" style="width: 50px; display: inline-block"
+                >4</span
+            >
+            <input type="range" id="pixelSize" min="1" max="32" value="4" />
+        </label>
+        <br />
+
+        <label
+            >Threshold:
+            <span id="thresholdVal" style="width: 50px; display: inline-block"
+                >128</span
+            >
+            <input type="range" id="threshold" min="1" max="255" value="128" />
+        </label>
+        <br /><br />
+
+        <canvas id="canvas"></canvas>
+
+        <script>
+            const fileInput = document.getElementById("fileInput");
+            const algoSelect = document.getElementById("algorithm");
+            const pixelSlider = document.getElementById("pixelSize");
+            const threshSlider = document.getElementById("threshold");
+            const pixelVal = document.getElementById("pixelSizeVal");
+            const threshVal = document.getElementById("thresholdVal");
+            const canvas = document.getElementById("canvas");
+            const ctx = canvas.getContext("2d");
+
+            const BAYER_4x4 = [
+                [0, 8, 2, 10],
+                [12, 4, 14, 6],
+                [3, 11, 1, 9],
+                [15, 7, 13, 5],
+            ];
+
+            let sourceImage = null;
+            let resizeTimer = null;
+
+            // --- Load image ---
+            fileInput.addEventListener("change", (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const img = new Image();
+                img.onload = () => {
+                    sourceImage = img;
+                    render();
+                };
+                img.src = URL.createObjectURL(file);
+            });
+
+            // --- Controls ---
+            pixelSlider.addEventListener("input", () => {
+                pixelVal.textContent = pixelSlider.value;
+                render();
+            });
+            threshSlider.addEventListener("input", () => {
+                threshVal.textContent = threshSlider.value;
+                render();
+            });
+            algoSelect.addEventListener("change", render);
+
+            // --- Debounced resize ---
+            window.addEventListener("resize", () => {
+                clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(render, 100);
+            });
+
+            // --- Compute display size to fit the window ---
+            function computeDisplaySize(img) {
+                const ratio = img.width / img.height;
+                let w = window.innerWidth;
+                let h = Math.round(w / ratio);
+                if (h > window.innerHeight) {
+                    h = window.innerHeight;
+                    w = Math.round(h * ratio);
+                }
+                return { w, h };
+            }
+
+            // --- Main render ---
+            function render() {
+                if (!sourceImage) return;
+
+                const pixelSize = parseInt(pixelSlider.value);
+                const threshold = parseInt(threshSlider.value);
+                const algo = algoSelect.value;
+
+                const { w, h } = computeDisplaySize(sourceImage);
+                canvas.width = w;
+                canvas.height = h;
+
+                ctx.drawImage(sourceImage, 0, 0, w, h);
+                const src = ctx.getImageData(0, 0, w, h).data;
+                const W = w;
+                const H = h;
+                const cols = Math.ceil(W / pixelSize);
+                const rows = Math.ceil(H / pixelSize);
+
+                // --- Step 1: Downsample to pixel grid (luminance average per block) ---
+                const grid = new Float32Array(cols * rows);
+
+                for (let row = 0; row < rows; row++) {
+                    for (let col = 0; col < cols; col++) {
+                        const x0 = col * pixelSize;
+                        const y0 = row * pixelSize;
+                        const x1 = Math.min(x0 + pixelSize, W);
+                        const y1 = Math.min(y0 + pixelSize, H);
+                        let lum = 0,
+                            count = 0;
+                        for (let y = y0; y < y1; y++) {
+                            for (let x = x0; x < x1; x++) {
+                                const i = (y * W + x) * 4;
+                                const a = src[i + 3] / 255;
+                                const r = src[i] * a + 255 * (1 - a);
+                                const g = src[i + 1] * a + 255 * (1 - a);
+                                const b = src[i + 2] * a + 255 * (1 - a);
+                                lum += 0.299 * r + 0.587 * g + 0.114 * b;
+                                count++;
+                            }
+                        }
+                        grid[row * cols + col] =
+                            count === 0 ? 255 : lum / count;
+                    }
+                }
+
+                // --- Step 2: Dithering ---
+                if (algo === "floyd") {
+                    floydSteinberg(grid, cols, rows, threshold);
+                } else if (algo === "bayer") {
+                    bayer(grid, cols, rows, threshold);
+                } else {
+                    random(grid, cols, rows, threshold);
+                }
+
+                // --- Step 3: Write back to canvas ---
+                const out = ctx.createImageData(W, H);
+                const outData = out.data;
+
+                for (let row = 0; row < rows; row++) {
+                    for (let col = 0; col < cols; col++) {
+                        const v = grid[row * cols + col] < 128 ? 0 : 255;
+                        const x0 = col * pixelSize;
+                        const y0 = row * pixelSize;
+                        const x1 = Math.min(x0 + pixelSize, W);
+                        const y1 = Math.min(y0 + pixelSize, H);
+                        for (let y = y0; y < y1; y++) {
+                            for (let x = x0; x < x1; x++) {
+                                const i = (y * W + x) * 4;
+                                outData[i] = v;
+                                outData[i + 1] = v;
+                                outData[i + 2] = v;
+                                outData[i + 3] = 255;
+                            }
+                        }
+                    }
+                }
+
+                ctx.putImageData(out, 0, 0);
+            }
+
+            // --- Floyd-Steinberg (B&W) ---
+            function floydSteinberg(grid, cols, rows, threshold) {
+                for (let row = 0; row < rows; row++) {
+                    for (let col = 0; col < cols; col++) {
+                        const i = row * cols + col;
+                        const orig = grid[i];
+                        const best = orig < threshold ? 0 : 255;
+                        grid[i] = best;
+                        const err = orig - best;
+
+                        if (col + 1 < cols)
+                            grid[i + 1] = Math.max(
+                                0,
+                                Math.min(255, grid[i + 1] + (err * 7) / 16),
+                            );
+                        if (row + 1 < rows) {
+                            if (col - 1 >= 0)
+                                grid[i + cols - 1] = Math.max(
+                                    0,
+                                    Math.min(
+                                        255,
+                                        grid[i + cols - 1] + (err * 3) / 16,
+                                    ),
+                                );
+                            grid[i + cols] = Math.max(
+                                0,
+                                Math.min(255, grid[i + cols] + (err * 5) / 16),
+                            );
+                            if (col + 1 < cols)
+                                grid[i + cols + 1] = Math.max(
+                                    0,
+                                    Math.min(
+                                        255,
+                                        grid[i + cols + 1] + (err * 1) / 16,
+                                    ),
+                                );
+                        }
+                    }
+                }
+            }
+
+            // --- Bayer 4x4 (B&W) ---
+            function bayer(grid, cols, rows, threshold) {
+                for (let row = 0; row < rows; row++) {
+                    for (let col = 0; col < cols; col++) {
+                        const i = row * cols + col;
+                        const lum = grid[i];
+                        const t =
+                            (threshold / 128) *
+                            (BAYER_4x4[row % 4][col % 4] / 16) *
+                            255;
+                        grid[i] = lum < t ? 0 : 255;
+                    }
+                }
+            }
+
+            // --- Random / stochastic (B&W) ---
+            function random(grid, cols, rows, threshold) {
+                for (let row = 0; row < rows; row++) {
+                    for (let col = 0; col < cols; col++) {
+                        const i = row * cols + col;
+                        const lum = grid[i];
+                        grid[i] =
+                            Math.random() * 255 < lum + (threshold - 128)
+                                ? 255
+                                : 0;
+                    }
+                }
+            }
+        </script>
+    </body>
+</html>
